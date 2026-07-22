@@ -1,0 +1,117 @@
+# =============================================================================
+# DFSP Configuration: GTO (single-tenant standalone)
+# =============================================================================
+# Hub APIs (MCM, Keycloak, ML adapter): in-cluster DNS *.mojaloop.svc.cluster.local.
+# FSPIOP inbound: ClusterIP (pas de LoadBalancer — hub in-cluster).
+
+dfsp:
+  id: "GTO"
+  fqdn: "gto.mojaloop.local"
+  currencies:
+    - XOF
+
+hub:
+  mcmServerEndpoint: "http://traefik.kube-system.svc.cluster.local:80"
+  iamProviderUrl: "http://keycloak.mojaloop.svc.cluster.local:8080"
+  extapiFqdn: "moja-ml-api-adapter-service.mojaloop.svc.cluster.local"
+  extapiPort: 80
+  services:
+    als: "moja-account-lookup-service.mojaloop.svc.cluster.local:80"
+    quotes: "moja-quoting-service.mojaloop.svc.cluster.local:80"
+    transfers: "moja-ml-api-adapter-service.mojaloop.svc.cluster.local:80"
+  auth:
+    clientId: "gto-client"
+    secretName: "gto-dfsp-auth"
+    secretKey: "clientSecret"
+
+backend:
+  useSimulator: true
+
+images:
+  mcmAgent:
+    repository: ndelma/mcm-agent
+    tag: "0.1.1"
+    pullPolicy: IfNotPresent
+  sdkSchemeAdapter:
+    repository: mojaloop/sdk-scheme-adapter
+    tag: v24.9.0
+    pullPolicy: IfNotPresent
+  simulator:
+    repository: mojaloop/mojaloop-simulator
+    tag: v15.5.4
+    pullPolicy: IfNotPresent
+  vault:
+    repository: hashicorp/vault
+    tag: "1.17"
+    pullPolicy: IfNotPresent
+  redis:
+    repository: redis
+    tag: "7.2-alpine"
+    pullPolicy: IfNotPresent
+
+vault:
+  persistence:
+    size: 1Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  recoveryKitSecretName: "dfsp-vault-recovery-kit"
+
+mcmAgent:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  logLevel: info
+  vaultRole: mcm-agent
+
+sdkSchemeAdapter:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  logLevel: info
+  multiTenant:
+    enabled: false
+  service:
+    inbound:
+      type: ClusterIP
+      port: 443
+      loadBalancerIP: ""
+      externalTrafficPolicy: ""
+
+simBackend:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  feeMultiplier: 0.05
+
+redis:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+common:
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+imagePullSecrets: []
