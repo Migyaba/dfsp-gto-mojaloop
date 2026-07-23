@@ -1,0 +1,174 @@
+{{- $mt := .Values.sdkSchemeAdapter.multiTenant.enabled | default false }}
+{{- if $mt }}
+{{- $tenants := .Values.tenants | default list }}
+{{- if eq (len $tenants) 0 }}
+{{- fail "sdkSchemeAdapter.multiTenant.enabled=true requires a non-empty .Values.tenants list." }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcm-agent-shared-seed
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mcm-agent
+data:
+  {{- range $tenant := $tenants }}
+  {{- $tenantId := required "tenant.id required" $tenant.id }}
+  {{- $tenantFqdn := required "tenant.fqdn required" $tenant.fqdn }}
+  {{- $oauthClientId := "" }}
+  {{- if $tenant.oauthClientId }}
+    {{- $oauthClientId = $tenant.oauthClientId }}
+  {{- else if eq (len $tenants) 1 }}
+    {{- $oauthClientId = include "dfsp.hub.auth.clientId" $ }}
+  {{- else }}
+    {{- $oauthClientId = printf "dfsp-%s" $tenantId }}
+  {{- end }}
+  {{- $secretName := $tenant.authSecretName | default (printf "hub-auth-%s-secret" $tenantId) }}
+  {{- $secretKey := $tenant.authSecretKey | default "client-secret" }}
+  {{- $authSecretObj := lookup "v1" "Secret" $.Release.Namespace $secretName }}
+  {{- $clientSecretValue := "" }}
+  {{- if $authSecretObj }}
+    {{- $clientSecretValue = index $authSecretObj.data $secretKey | b64dec }}
+  {{- else if eq (len $tenants) 1 }}
+    {{- /* Single row: allow global hub.dfsp OAuth secret naming (e.g. cmcalavi-dfsp-auth + clientSecret) */}}
+    {{- $fallbackName := include "dfsp.hub.auth.secretName" $ }}
+    {{- $fallbackKey := include "dfsp.hub.auth.secretKey" $ }}
+    {{- $fb := lookup "v1" "Secret" $.Release.Namespace $fallbackName }}
+    {{- if $fb }}
+      {{- $clientSecretValue = index $fb.data $fallbackKey | b64dec }}
+    {{- end }}
+  {{- end }}
+  {{ $tenantId }}.json: |
+    {
+      "common": {
+        "dfspId": {{ $tenantId | quote }}
+      },
+      "mcm": {
+        "serverEndpoint": {{ $.Values.hub.mcmServerEndpoint | quote }},
+        "hubIamProviderUrl": {{ $.Values.hub.iamProviderUrl | quote }},
+        "certExpiryThresholdDays": 30,
+        "auth": {
+          "enabled": true,
+          "creds": {
+            "clientId": {{ $oauthClientId | quote }},
+            "clientSecret": {{ $clientSecretValue | quote }}
+          }
+        }
+      },
+      "sdk": {
+        "fqdn": {{ $tenantFqdn | quote }},
+        "callbackUrl": "https://{{ $tenantFqdn }}:443",
+        "peerEndpoint": "{{ include "dfsp.hub.peerEndpoint" $ }}",
+        "alsEndpoint": "{{ include "dfsp.hub.alsEndpoint" $ }}",
+        "quotesEndpoint": "{{ include "dfsp.hub.quotesEndpoint" $ }}",
+        "transfersEndpoint": "{{ include "dfsp.hub.transfersEndpoint" $ }}",
+        "transactionRequestsEndpoint": "{{ include "dfsp.hub.transactionRequestsEndpoint" $ }}",
+        "bulkQuotesEndpoint": "{{ include "dfsp.hub.bulkQuotesEndpoint" $ }}",
+        "bulkTransfersEndpoint": "{{ include "dfsp.hub.bulkTransfersEndpoint" $ }}",
+        "currencies": {{ $tenant.currencies | default list | toJson }},
+        "whitelistIp": ["0.0.0.0/0"],
+        "tls": {
+          "outboundMutual": true,
+          "inboundMutual": true
+        },
+        "jws": {
+          "sign": true,
+          "validateInbound": false
+        },
+        "autoAccept": {
+          "party": true,
+          "quotes": false
+        },
+        "pm4mlEnabled": true
+      },
+      "dfspCaCsrParameters": {
+        "subject": {"CN": "{{ $tenantId }} CA", "O": {{ $tenantId | quote }}}
+      },
+      "dfspClientCsrParameters": {
+        "subject": {"CN": {{ $tenantId | quote }}}
+      },
+      "dfspServerCsrParameters": {
+        "subject": {"CN": {{ $tenantFqdn | quote }}},
+        "extensions": {
+          "subjectAltName": {"dns": [{{ $tenantFqdn | quote }}]}
+        }
+      }
+    }
+  {{- end }}
+{{- else }}
+{{- $tenantId := required "dfsp.id is required when sdkSchemeAdapter.multiTenant.enabled=false" $.Values.dfsp.id }}
+{{- $tenantFqdn := required "dfsp.fqdn is required when sdkSchemeAdapter.multiTenant.enabled=false" $.Values.dfsp.fqdn }}
+{{- $fallbackName := include "dfsp.hub.auth.secretName" . }}
+{{- $fallbackKey := include "dfsp.hub.auth.secretKey" . }}
+{{- $authSecretObj := lookup "v1" "Secret" .Release.Namespace $fallbackName }}
+{{- $clientSecretValue := "" }}
+{{- if $authSecretObj }}
+  {{- $clientSecretValue = index $authSecretObj.data $fallbackKey | b64dec }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dfsp.mcmAgent.name" . }}-seed
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mcm-agent
+data:
+  default.json: |
+    {
+      "common": {
+        "dfspId": {{ $tenantId | quote }}
+      },
+      "mcm": {
+        "serverEndpoint": {{ .Values.hub.mcmServerEndpoint | quote }},
+        "hubIamProviderUrl": {{ .Values.hub.iamProviderUrl | quote }},
+        "certExpiryThresholdDays": 30,
+        "auth": {
+          "enabled": true,
+          "creds": {
+            "clientId": {{ include "dfsp.hub.auth.clientId" . | quote }},
+            "clientSecret": {{ $clientSecretValue | quote }}
+          }
+        }
+      },
+      "sdk": {
+        "fqdn": {{ $tenantFqdn | quote }},
+        "callbackUrl": "https://{{ $tenantFqdn }}:443",
+        "peerEndpoint": "{{ include "dfsp.hub.peerEndpoint" . }}",
+        "alsEndpoint": "{{ include "dfsp.hub.alsEndpoint" . }}",
+        "quotesEndpoint": "{{ include "dfsp.hub.quotesEndpoint" . }}",
+        "transfersEndpoint": "{{ include "dfsp.hub.transfersEndpoint" . }}",
+        "transactionRequestsEndpoint": "{{ include "dfsp.hub.transactionRequestsEndpoint" . }}",
+        "bulkQuotesEndpoint": "{{ include "dfsp.hub.bulkQuotesEndpoint" . }}",
+        "bulkTransfersEndpoint": "{{ include "dfsp.hub.bulkTransfersEndpoint" . }}",
+        "currencies": {{ .Values.dfsp.currencies | toJson }},
+        "whitelistIp": ["0.0.0.0/0"],
+        "tls": {
+          "outboundMutual": true,
+          "inboundMutual": true
+        },
+        "jws": {
+          "sign": true,
+          "validateInbound": false
+        },
+        "autoAccept": {
+          "party": true,
+          "quotes": false
+        },
+        "pm4mlEnabled": true
+      },
+      "dfspCaCsrParameters": {
+        "subject": {"CN": "{{ $tenantId }} CA", "O": {{ $tenantId | quote }}}
+      },
+      "dfspClientCsrParameters": {
+        "subject": {"CN": {{ $tenantId | quote }}}
+      },
+      "dfspServerCsrParameters": {
+        "subject": {"CN": {{ $tenantFqdn | quote }}},
+        "extensions": {
+          "subjectAltName": {"dns": [{{ $tenantFqdn | quote }}]}
+        }
+      }
+    }
+{{- end }}

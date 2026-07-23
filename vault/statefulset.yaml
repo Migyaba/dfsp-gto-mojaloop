@@ -1,0 +1,136 @@
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "dfsp.vault.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vault
+spec:
+  serviceName: {{ include "dfsp.vault.name" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "dfsp.selectorLabels" (merge (dict "component" "vault") .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dfsp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: vault
+    spec:
+      serviceAccountName: {{ include "dfsp.vault.name" . }}
+      {{- include "dfsp.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        runAsUser: 100
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:   
+          type: RuntimeDefault                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
+      containers:
+        - name: vault
+          image: {{ include "dfsp.image" (dict "image" .Values.images.vault) }}
+          imagePullPolicy: {{ .Values.images.vault.pullPolicy }}
+          args: ["server"]
+          env:
+            - name: VAULT_ADDR
+              value: http://127.0.0.1:8200
+            - name: VAULT_API_ADDR
+              value: http://0.0.0.0:8200
+            - name: VAULT_LOCAL_CONFIG
+              value: |
+                {
+                  "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": true}}],
+                  "storage": {"file": {"path": "/vault/data"}},
+                  "default_lease_ttl": "8760h",
+                  "max_lease_ttl": "87600h",
+                  "ui": true,
+                  "disable_mlock": true
+                }
+            - name: SKIP_SETCAP
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 8200
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /v1/sys/health?standbyok=true&sealedcode=200&uninitcode=200
+              port: http
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.vault.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /vault/data
+        - name: unsealer
+          # Watches vault health; auto-unseals on restart using the key stored
+          # in the recovery kit Secret. Idempotent — does nothing when vault is
+          # already unsealed or uninitialized (the init Job handles first-time init).
+          image: {{ include "dfsp.image" (dict "image" .Values.images.vault) }}
+          imagePullPolicy: {{ .Values.images.vault.pullPolicy }}
+          env:
+            - name: VAULT_ADDR
+              value: http://127.0.0.1:8200
+            - name: UNSEAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vault.recoveryKitSecretName | quote }}
+                  key: unseal-key
+                  optional: true
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              while true; do
+                status=$(vault status -format=json 2>/dev/null || echo '{"sealed":true,"initialized":false}')
+                sealed=$(echo "$status" | grep -o '"sealed":[^,}]*' | cut -d: -f2 | tr -d ' ')
+                initialized=$(echo "$status" | grep -o '"initialized":[^,}]*' | cut -d: -f2 | tr -d ' ')
+                if [ "$initialized" = "true" ] && [ "$sealed" = "true" ] && [ -n "${UNSEAL_KEY:-}" ]; then
+                  echo "[unsealer] vault is sealed, unsealing..."
+                  vault operator unseal "$UNSEAL_KEY" >/dev/null 2>&1 || echo "[unsealer] unseal failed, will retry"
+                fi
+                sleep 10
+              done
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+      {{- with .Values.common.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.common.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.common.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "dfsp.labels" . | nindent 10 }}
+          app.kubernetes.io/component: vault
+      spec:
+        accessModes: [{{ .Values.vault.persistence.accessMode }}]
+        {{- with .Values.vault.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.vault.persistence.size }}

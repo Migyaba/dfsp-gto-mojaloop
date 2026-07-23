@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "dfsp.redis.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  serviceName: {{ include "dfsp.redis.name" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "dfsp.selectorLabels" (merge (dict "component" "redis") .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dfsp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+    spec:
+      {{- include "dfsp.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: {{ include "dfsp.image" (dict "image" .Values.images.redis) }}
+          imagePullPolicy: {{ .Values.images.redis.pullPolicy }}
+          command:
+            - redis-server
+            - --appendonly
+            - "no"
+            - --save
+            - ""
+            - --dir
+            - /tmp
+            - --stop-writes-on-bgsave-error
+            - "no"
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 15
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+      {{- with .Values.common.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.common.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.common.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dfsp.redis.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+  selector:
+    {{- include "dfsp.selectorLabels" (merge (dict "component" "redis") .) | nindent 4 }}

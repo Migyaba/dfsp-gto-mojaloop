@@ -1,0 +1,217 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dfsp.vault.name" . }}-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vault-init
+data:
+  init.sh: |
+    #!/bin/sh
+    # Bootstrap the DFSP's Vault:
+    #   - initialize (if needed), save root token + unseal key to a K8s Secret,
+    #   - unseal,
+    #   - enable Kubernetes auth and bind the mcm-agent SA to a role,
+    #   - enable PKI and generate the DFSP root CA,
+    #   - enable KV v2 (secret/) for agent config and KV v1 (secrets/) for state-machine state,
+    #   - create the mcm-agent policy.
+    # Idempotent: safe to re-run. Only initializes if Vault is uninitialized,
+    # only configures mounts/roles that are missing.
+    set -eu
+
+    VAULT_ADDR="{{ include "dfsp.vault.address" . }}"
+    export VAULT_ADDR
+
+    SECRET_NAME="{{ .Values.vault.recoveryKitSecretName }}"
+    NAMESPACE="{{ .Release.Namespace }}"
+    MCM_SA="{{ include "dfsp.mcmAgent.name" . }}"
+    MCM_ROLE="{{ .Values.mcmAgent.vaultRole }}"
+    PKI_CN="{{ .Values.dfsp.id }} Root CA"
+    PKI_TTL="87600h"
+    PKI_KEY_TYPE="rsa"
+    PKI_KEY_BITS="4096"
+
+    K8S_API="https://kubernetes.default.svc"
+    K8S_TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+    K8S_CACERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+    if ! command -v curl >/dev/null 2>&1; then
+      apk add --no-cache curl >/dev/null 2>&1
+    fi
+
+    k8s_api() {
+      method=$1
+      path=$2
+      shift 2
+      curl -sS --cacert "$K8S_CACERT" \
+        -H "Authorization: Bearer $K8S_TOKEN" \
+        -H "Content-Type: application/json" \
+        -X "$method" "$K8S_API$path" "$@"
+    }
+
+    echo "[init] waiting for vault to be reachable at $VAULT_ADDR"
+    for i in $(seq 1 60); do
+      if vault status -format=json >/tmp/status.json 2>/dev/null; then
+        break
+      fi
+      # vault status exits 2 when sealed and 1 when uninitialized; both fine.
+      if [ -s /tmp/status.json ]; then break; fi
+      sleep 2
+    done
+    vault status -format=json > /tmp/status.json 2>/dev/null || true
+    if [ ! -s /tmp/status.json ]; then
+      echo "[init] ERROR: vault unreachable after 2 minutes" >&2
+      exit 1
+    fi
+
+    initialized=$(vault status -format=json 2>/dev/null | grep -o '"initialized":[^,}]*' | cut -d: -f2 | tr -d ' ' || echo false)
+    sealed=$(vault status -format=json 2>/dev/null | grep -o '"sealed":[^,}]*' | cut -d: -f2 | tr -d ' ' || echo true)
+
+    if [ "$initialized" != "true" ]; then
+      echo "[init] initializing vault"
+      vault operator init -key-shares=1 -key-threshold=1 -format=json > /tmp/init.json
+      # Parse JSON - handle both compact and pretty-printed output
+      UNSEAL_KEY=$(tr -d ' \n\r' < /tmp/init.json | grep -o '"unseal_keys_b64":\[[^]]*\]' | grep -o '"[^"]*"' | head -2 | tail -1 | tr -d '"')
+      ROOT_TOKEN=$(tr -d ' \n\r' < /tmp/init.json | grep -o '"root_token":"[^"]*"' | cut -d'"' -f4)
+      echo "[init] parsed UNSEAL_KEY length=${#UNSEAL_KEY} ROOT_TOKEN length=${#ROOT_TOKEN}"
+
+      # Write the recovery kit Secret via the K8s API (no kubectl in this image).
+      UNSEAL_B64=$(printf '%s' "$UNSEAL_KEY" | base64 | tr -d '\n')
+      ROOT_B64=$(printf '%s' "$ROOT_TOKEN" | base64 | tr -d '\n')
+      cat > /tmp/secret.json <<EOF
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "$SECRET_NAME",
+          "labels": {
+            "app.kubernetes.io/managed-by": "dfsp-chart",
+            "dfsp.mojaloop.io/id": "{{ .Values.dfsp.id }}"
+          }
+        },
+        "type": "Opaque",
+        "data": {
+          "unseal-key": "$UNSEAL_B64",
+          "root-token": "$ROOT_B64"
+        }
+      }
+    EOF
+      # Create or replace — Secret may already exist from a prior failed run.
+      if k8s_api GET "/api/v1/namespaces/$NAMESPACE/secrets/$SECRET_NAME" -o /dev/null -w '%{http_code}' -s | grep -q 200; then
+        k8s_api PUT "/api/v1/namespaces/$NAMESPACE/secrets/$SECRET_NAME" --data-binary @/tmp/secret.json >/dev/null
+      else
+        k8s_api POST "/api/v1/namespaces/$NAMESPACE/secrets" --data-binary @/tmp/secret.json >/dev/null
+      fi
+      echo "[init] recovery kit written to Secret $SECRET_NAME"
+      rm -f /tmp/init.json
+    else
+      echo "[init] vault is already initialized"
+      # Read existing keys from the recovery kit Secret.
+      k8s_api GET "/api/v1/namespaces/$NAMESPACE/secrets/$SECRET_NAME" > /tmp/existing.json
+      UNSEAL_KEY=$(grep -o '"unseal-key":"[^"]*"' /tmp/existing.json | cut -d'"' -f4 | base64 -d)
+      ROOT_TOKEN=$(grep -o '"root-token":"[^"]*"' /tmp/existing.json | cut -d'"' -f4 | base64 -d)
+      rm -f /tmp/existing.json
+    fi
+
+    if [ "$sealed" = "true" ]; then
+      echo "[init] unsealing vault"
+      vault operator unseal "$UNSEAL_KEY" >/dev/null
+    fi
+
+    export VAULT_TOKEN="$ROOT_TOKEN"
+
+    echo "[init] enabling auth/kubernetes"
+    if ! vault auth list | grep -q '^kubernetes/'; then
+      vault auth enable kubernetes
+    fi
+    vault write auth/kubernetes/config \
+      kubernetes_host="$K8S_API" \
+      kubernetes_ca_cert=@"$K8S_CACERT" \
+      disable_iss_validation=true >/dev/null
+
+    echo "[init] creating mcm-agent policy"
+    vault policy write mcm-agent - <<'POLICY'
+    path "secret/data/mcm-agent/*" { capabilities = ["create","read","update","delete","list"] }
+    path "secret/metadata/mcm-agent/*" { capabilities = ["read","list","delete"] }
+    path "secrets/*"                 { capabilities = ["create","read","update","delete","list"] }
+    path "pki/*"                     { capabilities = ["create","read","update","delete","list","sudo"] }
+    path "pki_int/*"                 { capabilities = ["create","read","update","delete","list","sudo"] }
+    POLICY
+
+    echo "[init] creating K8s auth role $MCM_ROLE for SA $MCM_SA"
+    vault write auth/kubernetes/role/"$MCM_ROLE" \
+      bound_service_account_names="$MCM_SA" \
+      bound_service_account_namespaces="$NAMESPACE" \
+      policies=mcm-agent \
+      ttl=768h >/dev/null
+
+    echo "[init] enabling AppRole auth for mcm-agent"
+    if ! vault auth list | grep -q '^approle/'; then
+      vault auth enable approle
+    fi
+    vault write auth/approle/role/mcm-agent \
+      secret_id_ttl=0 \
+      token_ttl=768h \
+      token_max_ttl=768h \
+      policies=mcm-agent >/dev/null
+    ROLE_ID=$(vault read -field=role_id auth/approle/role/mcm-agent/role-id)
+    SECRET_ID=$(vault write -field=secret_id -f auth/approle/role/mcm-agent/secret-id)
+    echo "[init] AppRole role_id=${ROLE_ID}"
+
+    ROLE_ID_B64=$(printf '%s' "$ROLE_ID" | base64 | tr -d '\n')
+    SECRET_ID_B64=$(printf '%s' "$SECRET_ID" | base64 | tr -d '\n')
+    APPROLE_SECRET_NAME="{{ include "dfsp.mcmAgent.name" . }}-vault-approle"
+    cat > /tmp/approle-secret.json <<EOFAPPROLE
+    {
+      "apiVersion": "v1",
+      "kind": "Secret",
+      "metadata": {
+        "name": "$APPROLE_SECRET_NAME",
+        "labels": {
+          "app.kubernetes.io/managed-by": "dfsp-chart",
+          "app.kubernetes.io/component": "mcm-agent"
+        }
+      },
+      "type": "Opaque",
+      "data": {
+        "role-id": "$ROLE_ID_B64",
+        "secret-id": "$SECRET_ID_B64"
+      }
+    }
+    EOFAPPROLE
+    if k8s_api GET "/api/v1/namespaces/$NAMESPACE/secrets/$APPROLE_SECRET_NAME" -o /dev/null -w '%{http_code}' -s | grep -q 200; then
+      k8s_api PUT "/api/v1/namespaces/$NAMESPACE/secrets/$APPROLE_SECRET_NAME" --data-binary @/tmp/approle-secret.json >/dev/null
+    else
+      k8s_api POST "/api/v1/namespaces/$NAMESPACE/secrets" --data-binary @/tmp/approle-secret.json >/dev/null
+    fi
+    echo "[init] AppRole credentials written to Secret $APPROLE_SECRET_NAME"
+
+    echo "[init] enabling KV v2 at secret/ and KV v1 at secrets/"
+    if ! vault secrets list | grep -q '^secret/'; then
+      vault secrets enable -path=secret -version=2 kv
+    fi
+    if ! vault secrets list | grep -q '^secrets/'; then
+      vault secrets enable -path=secrets -version=1 kv
+    fi
+
+    echo "[init] enabling PKI + generating root CA"
+    if ! vault secrets list | grep -q '^pki/'; then
+      vault secrets enable pki
+      vault secrets tune -max-lease-ttl="$PKI_TTL" pki
+      vault write pki/root/generate/internal \
+        common_name="$PKI_CN" \
+        ttl="$PKI_TTL" \
+        key_type="$PKI_KEY_TYPE" \
+        key_bits="$PKI_KEY_BITS" >/dev/null
+      vault write pki/roles/mcm-server-role \
+        allow_any_name=true allow_localhost=true enforce_hostnames=false \
+        max_ttl=4000h ttl=4000h \
+        key_type="$PKI_KEY_TYPE" key_bits="$PKI_KEY_BITS" >/dev/null
+      vault write pki/roles/mcm-client-role \
+        allow_any_name=true allow_localhost=true enforce_hostnames=false \
+        max_ttl=4000h ttl=4000h \
+        key_type=any >/dev/null
+    fi
+
+    echo "[init] done"

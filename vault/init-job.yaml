@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "dfsp.vault.name" . }}-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vault-init
+  annotations:
+    # Re-run on upgrade (the script is idempotent and will only perform
+    # operations that haven't been done yet).
+    # Temporairement désactivé - initialisation manuelle requise
+    # "helm.sh/hook": post-install,post-upgrade
+    # "helm.sh/hook-weight": "1"
+    # "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "dfsp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: vault-init
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "dfsp.vault.name" . }}-init
+      {{- include "dfsp.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: init
+          image: {{ include "dfsp.image" (dict "image" .Values.images.vault) }}
+          imagePullPolicy: {{ .Values.images.vault.pullPolicy }}
+          command: ["/bin/sh", "/scripts/init.sh"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "dfsp.vault.name" . }}-init
+            defaultMode: 0755
+        - name: tmp
+          emptyDir: {}

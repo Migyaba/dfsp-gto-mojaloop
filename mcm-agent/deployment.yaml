@@ -1,0 +1,262 @@
+{{- $mt := .Values.sdkSchemeAdapter.multiTenant.enabled | default false }}
+{{- if $mt }}
+{{- if eq (len (.Values.tenants | default list)) 0 }}
+{{- fail "sdkSchemeAdapter.multiTenant.enabled=true requires a non-empty .Values.tenants list." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcm-agent-shared
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mcm-agent
+spec:
+  replicas: {{ .Values.mcmAgent.replicas }}
+  selector:
+    matchLabels:
+      {{- include "dfsp.selectorLabels" (merge (dict "component" "mcm-agent") .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dfsp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: mcm-agent
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/mcm-agent/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "dfsp.mcmAgent.name" . }}
+      {{- include "dfsp.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-vault
+          image: {{ include "dfsp.image" (dict "image" .Values.images.vault) }}
+          imagePullPolicy: {{ .Values.images.vault.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              VAULT_ADDR="{{ include "dfsp.vault.address" . }}"
+              for i in $(seq 1 120); do
+                status=$(wget -qO- "$VAULT_ADDR/v1/sys/health" 2>/dev/null || echo '{}')
+                if echo "$status" | grep -q '"initialized":true' && echo "$status" | grep -q '"sealed":false'; then
+                  echo "vault is ready"
+                  exit 0
+                fi
+                echo "[wait] vault not ready (attempt $i): $status"
+                sleep 5
+              done
+              exit 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      containers:
+        - name: mcm-agent
+          image: {{ include "dfsp.image" (dict "image" .Values.images.mcmAgent) }}
+          imagePullPolicy: {{ .Values.images.mcmAgent.pullPolicy }}
+          ports:
+            - name: api
+              containerPort: 3000
+              protocol: TCP
+            - name: control-ws
+              containerPort: 4004
+              protocol: TCP
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: PORT
+              value: "3000"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: LOG_LEVEL
+              value: {{ .Values.mcmAgent.logLevel | quote }}
+            - name: MULTI_TENANT_ENABLED
+              value: "true"
+            - name: VAULT_ENDPOINT
+              value: {{ include "dfsp.vault.address" . | quote }}
+            - name: VAULT_AUTH_ROLE_ID_PATH
+              value: /vault-approle/role-id
+            - name: VAULT_AUTH_SECRET_ID_PATH
+              value: /vault-approle/secret-id
+            - name: MCM_SERVER_ENDPOINT
+              value: {{ .Values.hub.mcmServerEndpoint | quote }}
+            - name: HUB_IAM_PROVIDER_URL
+              value: {{ .Values.hub.iamProviderUrl | quote }}
+            - name: HUB_EXTAPI_FQDN
+              value: {{ .Values.hub.extapiFqdn | quote }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.mcmAgent.resources | nindent 12 }}
+          volumeMounts:
+            - name: seed-config
+              mountPath: /app/config
+              readOnly: true
+            - name: vault-approle
+              mountPath: /vault-approle
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: seed-config
+          configMap:
+            name: mcm-agent-shared-seed
+        - name: vault-approle
+          secret:
+            secretName: {{ include "dfsp.mcmAgent.name" . }}-vault-approle
+        - name: tmp
+          emptyDir: {}
+{{- else }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dfsp.mcmAgent.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mcm-agent
+spec:
+  replicas: {{ .Values.mcmAgent.replicas }}
+  selector:
+    matchLabels:
+      {{- include "dfsp.selectorLabels" (merge (dict "component" "mcm-agent") .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dfsp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: mcm-agent
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/mcm-agent/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "dfsp.mcmAgent.name" . }}
+      {{- include "dfsp.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-vault
+          image: {{ include "dfsp.image" (dict "image" .Values.images.vault) }}
+          imagePullPolicy: {{ .Values.images.vault.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              VAULT_ADDR="{{ include "dfsp.vault.address" . }}"
+              for i in $(seq 1 120); do
+                status=$(wget -qO- "$VAULT_ADDR/v1/sys/health" 2>/dev/null || echo '{}')
+                if echo "$status" | grep -q '"initialized":true' && echo "$status" | grep -q '"sealed":false'; then
+                  echo "vault is ready"
+                  exit 0
+                fi
+                echo "[wait] vault not ready (attempt $i): $status"
+                sleep 5
+              done
+              exit 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      containers:
+        - name: mcm-agent
+          image: {{ include "dfsp.image" (dict "image" .Values.images.mcmAgent) }}
+          imagePullPolicy: {{ .Values.images.mcmAgent.pullPolicy }}
+          ports:
+            - name: api
+              containerPort: 3000
+              protocol: TCP
+            - name: control-ws
+              containerPort: 4004
+              protocol: TCP
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: PORT
+              value: "3000"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: LOG_LEVEL
+              value: {{ .Values.mcmAgent.logLevel | quote }}
+            - name: MULTI_TENANT_ENABLED
+              value: "false"
+            - name: DFSP_ID
+              value: {{ .Values.dfsp.id | quote }}
+            - name: DFSP_FQDN
+              value: {{ .Values.dfsp.fqdn | quote }}
+            - name: AUTH_CLIENT_ID
+              value: {{ include "dfsp.hub.auth.clientId" . | quote }}
+            - name: AUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dfsp.hub.auth.secretName" . }}
+                  key: {{ include "dfsp.hub.auth.secretKey" . }}
+            - name: VAULT_ENDPOINT
+              value: {{ include "dfsp.vault.address" . | quote }}
+            - name: VAULT_AUTH_ROLE_ID_PATH
+              value: /vault-approle/role-id
+            - name: VAULT_AUTH_SECRET_ID_PATH
+              value: /vault-approle/secret-id
+            - name: MCM_SERVER_ENDPOINT
+              value: {{ .Values.hub.mcmServerEndpoint | quote }}
+            - name: HUB_IAM_PROVIDER_URL
+              value: {{ .Values.hub.iamProviderUrl | quote }}
+            - name: HUB_EXTAPI_FQDN
+              value: {{ .Values.hub.extapiFqdn | quote }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.mcmAgent.resources | nindent 12 }}
+          volumeMounts:
+            - name: seed-config
+              mountPath: /app/config
+              readOnly: true
+            - name: vault-approle
+              mountPath: /vault-approle
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: seed-config
+          configMap:
+            name: {{ include "dfsp.mcmAgent.name" . }}-seed
+        - name: vault-approle
+          secret:
+            secretName: {{ include "dfsp.mcmAgent.name" . }}-vault-approle
+        - name: tmp
+          emptyDir: {}
+{{- end }}

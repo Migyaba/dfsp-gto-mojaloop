@@ -1,0 +1,75 @@
+---
+# ServiceAccount used by the Vault pod. Needs system:auth-delegator at cluster
+# scope so Vault can call TokenReview when handling Kubernetes auth logins from
+# the mcm-agent pod.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "dfsp.vault.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vault
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  # ClusterRoleBinding must be cluster-unique — include namespace in the name.
+  name: {{ include "dfsp.vault.name" . }}-{{ .Release.Namespace }}-auth-delegator
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vault
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dfsp.vault.name" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Separate ServiceAccount for the one-shot init Job. Needs the ability to
+# create/read a single Secret (the recovery kit) in the release namespace —
+# nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "dfsp.vault.name" . }}-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vault-init
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "dfsp.vault.name" . }}-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vault-init
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "patch", "update"]
+    resourceNames: [{{ .Values.vault.recoveryKitSecretName | quote }}]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "dfsp.vault.name" . }}-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dfsp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vault-init
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "dfsp.vault.name" . }}-init
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dfsp.vault.name" . }}-init
+    namespace: {{ .Release.Namespace }}
