@@ -1,0 +1,82 @@
+version: '3.8'
+
+networks:
+  sdk-network:
+    name: sdk-network-gto
+    driver: bridge
+
+services:
+  redis:
+    image: redis:6.2.4-alpine
+    container_name: sdk-redis-gto
+    networks:
+      - sdk-network
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      timeout: 20s
+      retries: 10
+      start_period: 10s
+      interval: 30s
+    restart: unless-stopped
+
+  mock-dfsp-backend:
+    image: mojaloop/sdk-mock-dfsp-backend:latest
+    container_name: sdk-mock-backend-gto
+    networks:
+      - sdk-network
+    ports:
+      - "3000:3000"
+    environment:
+      - DFSP_ID=CMCOTONOU
+      - SCHEME_ADAPTER_ENDPOINT=http://sdk-scheme-adapter:4001
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+  sdk-scheme-adapter:
+    image: mojaloop/sdk-scheme-adapter:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: sdk-scheme-adapter-api-svc-gto
+    networks:
+      - sdk-network
+    env_file:
+      - ./.env
+    ports:
+      - "4000:4000"
+      - "4001:4001"
+      - "4002:4002"
+      - "4004:4004"
+    volumes:
+      - ./secrets:/opt/app/secrets:ro
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    extra_hosts:
+      - "ml-api-adapter.local:192.168.0.154"
+      - "account-lookup-service.local:192.168.0.154"
+      - "quoting-service.local:192.168.0.154"
+      - "transfer-api-svc.local:192.168.0.154"
+      - "central-ledger.local:192.168.0.154"
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-dfsp-backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:4001/health || exit 1"]
+      timeout: 20s
+      retries: 10
+      start_period: 40s
+      interval: 30s
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+    name: sdk-redis-data-gto
